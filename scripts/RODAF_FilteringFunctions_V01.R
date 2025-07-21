@@ -61,7 +61,7 @@ spurious_spikes_filter <- function(DECounts, design) {
         return((max(gene_counts[sampleCols]) / sum(gene_counts[sampleCols])) >= 1.4 * (length(sampleCols))^(-0.66))
       }
     })
-    return(sum(spikePass) <= 1)  # Spike filter fails if >1 group has a spike
+    return(sum(spikePass) <= 2)  # Spike filter fails if >2 group has a spike
   })
   Filter[, 1] <- as.numeric(spike_check)
   
