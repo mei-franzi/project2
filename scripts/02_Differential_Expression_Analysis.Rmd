@@ -1,0 +1,186 @@
+---
+title: "Differential expression analysis"
+author: "FM"
+date: "2025-07-18"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Set cache directory relative to current file location
+knitr::opts_chunk$set(cache.path = "02_Differential_Expression_Analysis_cache/")
+
+
+library(tidyverse)
+library(DESeq2)
+library(knitr)
+library(ggplot2)
+library(dplyr)
+library(EnhancedVolcano) 
+
+# Load filtered data from previous analysis
+results_list <- readRDS("/Users/u013911/Desktop/project2/results_list_filtered.rds")
+metadata_focused <- readRDS("/Users/u013911/Desktop/project2/metadata_focused.rds")
+
+```
+
+
+## Biological Questions
+
+- Dox-4F vs Control - What changes does reprogramming cause to the transcriptome? (reprogrammed old transgenic vs old wildtype baseline)
+- Dox-4F vs Young - What's the difference between reprogrammed and young states? (how far is reprogramming from true youth?)
+- Control vs Young - What's the natural aging signature? (old wildtype vs young transgenic baseline)
+
+Are young controls expression profiles more similar to reprogrammed 4F mice or to old control mice?
+
+
+## Multi-Group Analysis Reduces DEG Detection
+
+### 1. Dispersion Estimation Problems
+
+When processing together, DESeq2 estimates gene dispersion and sample size factors dependent on ALL samples in a dataset. These parameters are used when normalizing counts and determining differential expression. ([Conducting pair-wise comparison in DESeq2?](https://support.bioconductor.org/p/9149442/))
+
+Multi-group analysis can lead to "exaggerated dispersion values" compared to pairwise analysis, making DESeq2 more conservative.
+
+### 2. Statistical Framework Issues
+
+There is a problem with multi-group analysis from a statistical point of view. DESeq2 uses a chi-squared like strategy and binomial test - the analysis is better when you there is one vs another group. In other words: the logic in RNA-Seq still works in a 2D universe (difference of A-B) and you are talking about 3D (difference of A-B-C). ([DESeq2 multiple comparison - SEQanswers](https://www.seqanswers.com/forum/bioinformatics/bioinformatics-aa/74283-deseq2-multiple-comparison))
+
+### 3. Expert Recommendations
+
+**Michael Love (DESeq2 creator) recommends:** "Performing pairwise Wald tests and looking at the intersection is my preferred way of specifying that A is different than B and A is different than C." ([DeSeq2 with three groups which approach to use? LRT or just do multiple pairwise comparisons?](https://support.bioconductor.org/p/105885/))
+
+The case where you still are better off estimating dispersion over all tissues is if you have low sample size per tissue, and here I might say, less than 5 samples per tissue. ([DESeq2 normalization and group-wise or pair-wise comparisons](https://support.bioconductor.org/p/102747/))
+
+### Key Evidence from Literature
+
+A researcher reported: "More usefully, the 'split into pairs' analysis gives **878 significant genes** whereas the 'all together' analysis gives **566 significant genes**, which is consistent with exaggerated dispersion values in the 'all together' analysis." ([DESeq2 normalization and group-wise or pair-wise comparisons](https://support.bioconductor.org/p/102747/))
+
+Another study showed:
+- **Pairwise analysis**: 215 DEGs (83 up, 132 down) 
+- **Multi-group analysis**: 49 DEGs (19 up, 30 down)
+
+([DESeq2 for pairwise comparison of multiple groups](https://www.biostars.org/p/439436/))
+
+### Conclusion
+
+Comparing three-group comparison to two-group comparison dramatically lowers DEG counts (77 vs 786 for liver) in line with what the literature predicts for multi-group vs pairwise analyses. The recommended approach is to:
+
+1. **Use 3-group filtering** (keeps genes expressed in any condition)
+2. **Run three separate 2-group DESeq2 analyses** (optimal statistical power)
+
+```{r function for pairwise DEGs, cache=TRUE}
+# Function to run pairwise DEG analysis for a single tissue
+run_pairwise_deg_analysis <- function(dds_filtered_3group, tissue_name, alpha = 0.01, lfc_threshold = 0.5) {
+  
+  # Define the three pairwise comparisons
+  comparisons <- list(
+    reprogramming_control = c("Dox-4F", "Control"),
+    reprogramming_young = c("Dox-4F", "None"), 
+    old_young = c("Control", "None")
+  )
+  
+  # Run each pairwise comparison separately
+  deg_results <- map(comparisons, function(groups_to_compare) {
+    # Subset to only the two groups for this comparison
+    samples_subset <- colnames(dds_filtered_3group)[dds_filtered_3group$treatment %in% groups_to_compare]
+    dds_pairwise <- dds_filtered_3group[, samples_subset]
+    
+    # Drop unused factor levels
+    dds_pairwise$treatment <- droplevels(dds_pairwise$treatment)
+    
+    # Run DESeq on the 2-group subset
+    dds_pairwise <- DESeq(dds_pairwise, quiet = TRUE)
+    
+    # Create contrast for this comparison (first group vs second group)
+    contrast_vector <- c("treatment", groups_to_compare[1], groups_to_compare[2])
+    
+    # Extract results with manual log2FC filtering
+    res <- results(dds_pairwise, 
+                   contrast = contrast_vector,
+                   alpha = alpha,
+                   cooksCutoff = FALSE,
+                   independentFiltering = FALSE,
+                   pAdjustMethod = 'fdr')
+    
+    # Convert to data frame and apply manual filtering
+    res_df <- as.data.frame(res) %>%
+      rownames_to_column("gene_id") %>%
+      filter(!is.na(padj)) %>%
+      arrange(padj, pvalue) %>%
+      mutate(
+        significance = case_when(
+          padj < alpha & abs(log2FoldChange) >= lfc_threshold ~ "Significant",
+          TRUE ~ "Not significant"
+        ),
+        direction = case_when(
+          significance == "Significant" & log2FoldChange > 0 ~ "Up",
+          significance == "Significant" & log2FoldChange < 0 ~ "Down",
+          TRUE ~ "None"
+        )
+      )
+    
+    return(res_df)
+  })
+  
+  # Add tissue and comparison names
+  deg_results <- imap(deg_results, function(res, comp_name) {
+    res$tissue <- tissue_name
+    res$comparison <- comp_name
+    return(res)
+  })
+  
+  return(deg_results)
+}
+```
+
+```{r pairwise DEGs, cache=TRUE}
+# Run pairwise DEG analysis for all tissues
+all_pairwise_deg_results <- map(results_list, function(tissue_data) {
+  run_pairwise_deg_analysis(tissue_data$dds_filtered, tissue_data$tissue)
+})
+
+# Flatten results for easier handling
+all_pairwise_deg_results_flat <- map_dfr(1:length(all_pairwise_deg_results), function(i) {
+  tissue_results <- all_pairwise_deg_results[[i]]
+  map_dfr(tissue_results, identity)
+})
+
+# Summary statistics
+pairwise_deg_summary <- all_pairwise_deg_results_flat %>%
+  filter(significance == "Significant") %>%
+  dplyr::count(tissue, comparison, direction) %>%
+  pivot_wider(names_from = direction, values_from = n, values_fill = 0) %>%
+  mutate(Total = Up + Down)
+
+kable(pairwise_deg_summary, caption = "Pairwise DEG Summary by Tissue and Comparison")
+```
+
+```{r pairwise summary tables}
+# Create summary tables for each pairwise comparison
+pairwise_comparison_summaries <- all_pairwise_deg_results_flat %>%
+  filter(significance == "Significant") %>%
+  group_by(comparison) %>%
+  summarise(
+    total_degs = n(),
+    up_regulated = sum(direction == "Up"),
+    down_regulated = sum(direction == "Down"),
+    tissues_with_degs = n_distinct(tissue),
+    .groups = "drop"
+  )
+
+kable(pairwise_comparison_summaries, caption = "Pairwise DEG Summary Across All Tissues by Comparison Type")
+```
+
+```{r save pairwise results}
+# Save pairwise DEG results
+saveRDS(all_pairwise_deg_results, "pairwise_deg_results_by_tissue.rds")
+
+```
