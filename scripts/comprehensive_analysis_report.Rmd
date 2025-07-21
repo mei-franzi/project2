@@ -1,0 +1,369 @@
+---
+title: "Comprehensive RNAseq Analysis Report: Sample Size and Statistical Power Assessment"
+author: "FM"
+date: "2025-07-18"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(knitr)
+library(ggplot2)
+library(readr) # read_tsv 
+library(dplyr) # case_when 
+library(tidyverse) # pivot_wider, metadata processing 
+
+
+# Load data 
+counts <- read_tsv("/Users/u013911/Desktop/project2/data/counts.tsv", show_col_types = FALSE)
+metadata <- read_tsv("/Users/u013911/Desktop/project2/data/metadata.tsv", show_col_types = FALSE)
+
+# Clean count data 
+counts <- as.data.frame(counts)
+rownames(counts) <- counts$...1
+counts <- counts[, -1]
+
+# Standardize strain names
+metadata$strain <- gsub("4F-het-C57BL/6", "4F", metadata$strain)
+metadata$strain <- gsub("C57BL/6", "WT", metadata$strain)
+
+# Simplify sex coding
+replacements <- c("male" = "m", "female" = "f")
+metadata$sex <- replacements[metadata$sex]
+
+# Standardize treatment names
+metadata$treatment[metadata$strain == "WT" & metadata$treatment == "Dox-4F"] <- "Dox"
+
+
+# Create analysis grouping variables
+metadata <- metadata %>%
+  mutate(
+    # Age groups with abbreviations
+    age_group = case_when(
+      age == "3_months" ~ "young", 
+      age == "22_months" ~ "old", 
+      age %in% c("25_months", "26_months") ~ "v.old"),
+    # Strain groups  
+    strain_group = case_when(
+      strain == "4F" ~ "4F", 
+      strain == "WT" ~ "WT"),
+    # Treatment groups
+    treatment_group = case_when(
+      treatment %in% c("Dox-4F", "Dox") ~ "Dox", 
+      treatment %in% c("Control", "None") ~ "control"),
+    # Treatment duration with abbreviations
+    treatment_duration = case_when(
+      treatment_time == "1-month" ~ "1m", 
+      treatment_time == "7-months" ~ "7m", 
+      treatment_time == "10-months" ~ "10m"),
+    # Biological group with abbreviations
+    biological_group = case_when(
+      strain == "4F" & treatment_group == "Dox" ~ "reprogrammed",
+      strain == "4F" & treatment_group == "control" ~ "transgene",
+      strain == "WT" & treatment_group == "Dox" ~ "WT_Dox",
+      strain == "WT" & treatment_group == "control" ~ "WT"),
+    # Tissue abbreviations
+    tissue_abbr = case_when(
+      tissue == "Kidney" ~ "Kid",
+      tissue == "Liver" ~ "Liv",
+      tissue == "Lung" ~ "Lun",
+      tissue == "Muscle" ~ "Mus",
+      tissue == "Skeletal Muscle" ~ "SkM",
+      tissue == "Skin" ~ "Ski",
+      tissue == "Spleen" ~ "Spl"),
+    # Group identifiers
+    group = paste(age_group, biological_group, 
+                  ifelse(age_group == "young", "", treatment_duration), 
+                  sep = "_"),
+    group_with_tissue = paste(tissue_abbr, group, sep = "_"))
+```
+
+this R markdown aims to comprehensivesly show the sample selection processs. It includes a sample summary, a feasiblity matrix, examines the distribution of the data and contains some information from the literature, such as the influence of sample size on statistical power. Generally, the more samples the better. DESeq performs best when sample size is five or higher. DESeq2 is the tool of choice. 
+After 
+
+
+
+### Power and Tool Selection Priorities in RNA-seq Analysis
+
+Tool choice on differential expression analysis, for read alignment, expression modeling and DEG identification, impacts performance. 
+Based on systematic evaluation of RNA-seq differential expression workflows, the following hierarchy of factors are important:
+
+#### 1. Sample Size (Primary Factor)
+
+**Baccarella et al. (2018)** [empirical assessment](https://doi.org/10.1186/s12859-018-2445-2) demonstrated that:
+
+- Read depth has little effect on workflow performance when held above **two million reads per sample**
+- **Increasing biological replicates increases power or gene recall more drastically than increasing read depth**
+
+**Ching et al. (2014)** [power analysis study](https://doi.org/10.1261/rna.046011.114) confirmed:
+
+- **The dominant contributing factor to reach optimal power is sample size**, rather than sequencing depth
+- Optimal sequencing depth around **20 million reads range** for most DE detection packages
+
+#### 2. Tool Selection (Distribution-Dependent)
+
+**Li et al. (2022)** [method comparison](https://doi.org/10.1371/journal.pone.0264246) found tool performance varies by sample size and data distribution:
+
+**For negative binomial distribution:**
+
+- **n=3 per group:** EBSeq performed better than other methods (FDR control, power, stability)
+- **n=6-12 per group:** DESeq2 performed slightly better than other methods
+
+**For log-normal distribution:**
+
+- **DESeq and DESeq2** methods performed better across all sample sizes (FDR control, power, stability)
+
+**Overall tool recommendations:**
+
+- **DESeq2 and edgeR** appear to be the better choices for overall performance
+
+#### 3. Read Depth (Secondary Factor)
+
+Performance of DEG identification workflows is measured by:
+
+- **Precision:** fraction of genes correctly identified as differentially expressed
+- **Recall:** fraction of DEGs identified
+
+Tool choice impacts performance across read alignment, expression modeling, and DEG identification steps.
+
+## Expression Distribution Analysis
+
+### Data Distribution Assessment
+
+
+```{r load-data-and-analysis, fig.height=10, fig.width=12}
+# Sample 5000 genes for robust distribution analysis
+set.seed(123)
+sample_genes <- sample(nrow(counts), 5000)
+sample_counts <- as.matrix(counts[sample_genes, ])
+
+# Calculate mean-variance relationship
+gene_means <- rowMeans(sample_counts)
+gene_vars <- apply(sample_counts, 1, var)
+
+# Remove genes with zero variance or mean
+valid_genes <- gene_means > 0 & gene_vars > 0
+gene_means_clean <- gene_means[valid_genes]
+gene_vars_clean <- gene_vars[valid_genes]
+
+# Quantify overdispersion
+overdispersion_ratio <- gene_vars_clean / gene_means_clean
+pct_overdispersed <- round(mean(overdispersion_ratio > 1, na.rm = TRUE) * 100, 1)
+mean_overdispersion <- round(mean(overdispersion_ratio, na.rm = TRUE), 2)
+median_overdispersion <- round(median(overdispersion_ratio, na.rm = TRUE), 2)
+
+# Display metrics
+cat("Valid genes analyzed:", length(gene_means_clean), "\n")
+cat("Overdispersed genes:", pct_overdispersed, "%\n")
+cat("Mean overdispersion ratio:", mean_overdispersion, "\n")
+
+# Create data frame for ggplot
+plot_data <- data.frame(
+  mean_expr = gene_means_clean,
+  variance = gene_vars_clean
+)
+
+
+# Create the plot
+p1 <- ggplot(plot_data, aes(x = mean_expr, y = variance)) +
+  geom_point(alpha = 0.4, size = 1) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linewidth = 1) +
+  geom_smooth(method = "lm", color = "blue", se = FALSE, linewidth = 1) +
+  labs(
+    x = "Mean expression",
+    y = "Variance", 
+    title = "Mean-Variance Relationship",
+    subtitle = "Distribution Assessment"
+  ) +
+  theme_minimal() +
+  annotate("text", x = max(gene_means_clean) * 0.7, y = max(gene_vars_clean) * 0.9, 
+           label = "Red line: Var = Mean (Poisson)\nBlue line: Observed relationship", 
+           color = "black", size = 3)
+p1
+
+```
+### Results Interpretation
+
+**Distribution Assessment Results:**
+
+- **Valid genes analyzed:** `r length(gene_means_clean)` genes
+- **Overdispersed genes:** `r pct_overdispersed`% show variance > mean  
+- **Mean overdispersion ratio:** `r mean_overdispersion` 
+- **Median overdispersion ratio:** `r median_overdispersion`
+
+**Conclusion:** With `r pct_overdispersed`% of genes showing overdispersion and a mean ratio of `r mean_overdispersion`, our data clearly follows a **negative binomial distribution** rather than Poisson or log-normal.
+
+**Statistical Method Implications:**
+Based on Li et al. (2022), for negative binomial data:
+
+- Groups with n=3: EBSeq recommended
+- Groups with n≥6: DESeq2 optimal
+- Our sample sizes require careful method selection per comparison
+
+## Experimental Design Assessment
+This section evaluates sample sizes across experimental groups to identify statistically viable comparisons. 
+
+- minimum samples per group: 3 
+
+```{r feasibility-matrix}
+# Create feasibility matrix with sample sizes per experimental group
+feasibility_matrix <- metadata %>%
+  count(tissue, age_group, strain_group, treatment_group, treatment_duration, biological_group) %>%
+  complete(tissue, age_group, strain_group, treatment_group, treatment_duration, fill = list(n = 0))
+
+# Add power categories based on sample size
+feasibility_matrix <- feasibility_matrix %>%
+  mutate(
+    power_tier = case_when(
+      n >= 5 ~ "Adequate",       
+      n == 3 | n == 4 ~ "Borderline",  
+      n == 1 | n == 2 ~ "Insufficient",   
+      n == 0 ~ "No samples"),
+    # Recreate biological_group for the zero-count rows created by complete()
+    biological_group = case_when(
+      !is.na(biological_group) ~ biological_group,  # Keep existing values
+      strain_group == "4F" & treatment_group == "Dox" ~ "reprogrammed",
+      strain_group == "4F" & treatment_group == "control" ~ "transgene",
+      strain_group == "WT" & treatment_group == "Dox" ~ "WT_Dox",
+      strain_group == "WT" & treatment_group == "control" ~ "WT"))
+
+# Filter to only groups with samples
+existing_groups <- feasibility_matrix %>%
+  filter(n > 0) %>%
+  arrange(tissue, desc(n))
+
+# Distribution of sample sizes
+sample_size_dist <- existing_groups %>%
+  count(n, name = "n_groups") %>%
+  mutate(percentage = round(n_groups / sum(n_groups) * 100, 1))
+
+sample_size_dist
+```
+
+
+
+### Ranked Visualization of Available Comparisons
+
+```{r ranked-comparisons, fig.height=10, fig.width=12}
+### Ranked Visualization of Available Comparisons
+
+p2 <- existing_groups %>%
+  mutate(
+    group_combined = paste0(age_group, "_", biological_group, 
+                           ifelse(age_group == "young", "", paste0("_", treatment_duration)))) %>%
+  ggplot(aes(x = group_combined, y = n)) +
+  geom_segment(aes(xend = group_combined, yend = 0), 
+               color = "gray70", linewidth = 0.8) +
+  geom_point(aes(color = power_tier), size = 3) +
+  geom_hline(yintercept = 5, linetype = "dashed", color = "black", linewidth = 0.8) +
+  facet_wrap(~tissue, scales = "free_y", ncol = 2) +
+  scale_color_manual(values = c("Adequate" = "#27ae60", 
+                              "Borderline" = "#f39c12", 
+                              "Insufficient" = "#e74c3c")) +
+  coord_flip() +
+  labs(title = "Sample Sizes by Tissue and Experimental Group",
+       x = "Experimental Group", 
+       y = "Sample Size",
+       color = "Power Tier") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 7),
+        strip.text = element_text(face = "bold"))
+p2
+
+```
+## explanation 
+### Experimental Group Abbreviations
+
+```{r abbreviation-table}
+# Create abbreviation reference table
+abbreviation_guide <- data.frame(
+ Category = c(rep("Age", 3), rep("Strain/Treatment", 4), rep("Duration", 3)),
+ Abbreviation = c("young", "old", "v.old",
+                  "4F+", "4F-", "WT+", "WT-",
+                  "1m", "7m", "10m"),
+ Full_Description = c("3 months (baseline control)",
+                      "22 months",
+                      "25-26 months (very old)",
+                      "Transgenic 4F with Dox (reprogrammed)",
+                      "Transgenic 4F control (no treatment)",
+                      "Wildtype with Dox",
+                      "Wildtype control",
+                      "1 month treatment (short)",
+                      "7 months treatment (long)",
+                      "10 months treatment (extended)"))
+
+kable(abbreviation_guide, caption = "Abbreviation Guide for Experimental Groups")
+```
+
+### Critical Gap Analysis
+
+```{r young-control-analysis}
+# Check which tissues have young control groups
+young_controls <- existing_groups %>%
+  filter(age_group == "young", treatment_group == "control") %>%
+  dplyr::select(tissue, strain_group, treatment_duration, n)
+
+# Tissues with ANY young samples
+tissues_with_young <- existing_groups %>%
+  filter(age_group == "young") %>%
+  distinct(tissue) %>%
+  pull(tissue)
+
+# Tissues lacking young controls
+all_tissues <- unique(existing_groups$tissue)
+tissues_without_young <- setdiff(all_tissues, tissues_with_young)
+
+kable(young_controls, caption = "Available Young Control Groups")
+
+cat("\nTissues completely lacking young samples:", 
+    paste(tissues_without_young, collapse = ", "))
+```
+
+- Best coverage: Kidney and Liver tissues show the most complete experimental designs
+- Limited comparisons: The sparsity of adequate sample sizes constrains the number of meaningful differential expression analyses possible
+-  tissues_with_young control group are "Kidney" "Liver"  "Lung"   "Muscle" "Skin"   "Spleen" 
+
+
+### Sample and Group selection 
+
+- based on numbers of samples, and rejuventation-efficiency, the 7-month treatment duration and young 4F control mice  will be retained. 
+- Skeletal muscle is excluded. No seven-month treatment group, no young controls. 
+
+```{r key comparison selection}
+# Subset metadata to focus on key comparisons
+metadata_focused <- metadata %>%
+ filter(treatment_duration == "7m" | age_group == "young")
+
+# Update biological_group for young samples
+metadata_focused <- metadata_focused %>%
+  mutate(biological_group = ifelse(age_group == "young", "young_transgene", biological_group))
+
+
+# Count samples per tissue and group
+group_summary <- metadata_focused %>%
+  count(tissue, biological_group) %>%
+  arrange(tissue, desc(n))
+
+group_summary <- group_summary %>%
+  pivot_wider(names_from = biological_group, values_from = n, values_fill = 0) %>%
+  dplyr::select(tissue, 
+                reprogrammed = reprogrammed,
+                WT = WT,
+                young_transgene = young_transgene)
+
+kable(group_summary, caption = "Sample Counts per Tissue and Group (Final Format)")
+```
+
+
+# 
+
+
+
+
