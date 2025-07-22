@@ -24,6 +24,7 @@ library(knitr)
 library(ggplot2)
 library(dplyr)
 library(EnhancedVolcano) 
+library(patchwork)
 
 # Load filtered data from previous analysis
 results_list <- readRDS("/Users/u013911/Desktop/project2/results_list_filtered.rds")
@@ -32,34 +33,34 @@ metadata_focused <- readRDS("/Users/u013911/Desktop/project2/metadata_focused.rd
 ```
 
 
-## Biological Questions
+### Biological Questions
 
-- Dox-4F vs Control - What changes does reprogramming cause to the transcriptome? (reprogrammed old transgenic vs old wildtype baseline)
-- Dox-4F vs Young - What's the difference between reprogrammed and young states? (how far is reprogramming from true youth?)
+- Dox-4F vs Control - What changes does reprogramming cause to the transcriptome? (reprogrammed old transgenic vs old age-matched wildtype)
+- Dox-4F vs Young - What's the difference between reprogrammed and young mice? (is reprogrammed closer to young mice?)
 - Control vs Young - What's the natural aging signature? (old wildtype vs young transgenic baseline)
 
 Are young controls expression profiles more similar to reprogrammed 4F mice or to old control mice?
 
 
-## Multi-Group Analysis Reduces DEG Detection
+### Multi-Group Analysis Reduces DEG Detection
 
-### 1. Dispersion Estimation Problems
+#### 1. Dispersion Estimation Problems
 
 When processing together, DESeq2 estimates gene dispersion and sample size factors dependent on ALL samples in a dataset. These parameters are used when normalizing counts and determining differential expression. ([Conducting pair-wise comparison in DESeq2?](https://support.bioconductor.org/p/9149442/))
 
 Multi-group analysis can lead to "exaggerated dispersion values" compared to pairwise analysis, making DESeq2 more conservative.
 
-### 2. Statistical Framework Issues
+#### 2. Statistical Framework Issues
 
 There is a problem with multi-group analysis from a statistical point of view. DESeq2 uses a chi-squared like strategy and binomial test - the analysis is better when you there is one vs another group. In other words: the logic in RNA-Seq still works in a 2D universe (difference of A-B) and you are talking about 3D (difference of A-B-C). ([DESeq2 multiple comparison - SEQanswers](https://www.seqanswers.com/forum/bioinformatics/bioinformatics-aa/74283-deseq2-multiple-comparison))
 
-### 3. Expert Recommendations
+#### 3. Michael Love Recommendations
 
 **Michael Love (DESeq2 creator) recommends:** "Performing pairwise Wald tests and looking at the intersection is my preferred way of specifying that A is different than B and A is different than C." ([DeSeq2 with three groups which approach to use? LRT or just do multiple pairwise comparisons?](https://support.bioconductor.org/p/105885/))
 
 The case where you still are better off estimating dispersion over all tissues is if you have low sample size per tissue, and here I might say, less than 5 samples per tissue. ([DESeq2 normalization and group-wise or pair-wise comparisons](https://support.bioconductor.org/p/102747/))
 
-### Key Evidence from Literature
+#### more comments
 
 A researcher reported: "More usefully, the 'split into pairs' analysis gives **878 significant genes** whereas the 'all together' analysis gives **566 significant genes**, which is consistent with exaggerated dispersion values in the 'all together' analysis." ([DESeq2 normalization and group-wise or pair-wise comparisons](https://support.bioconductor.org/p/102747/))
 
@@ -69,7 +70,7 @@ Another study showed:
 
 ([DESeq2 for pairwise comparison of multiple groups](https://www.biostars.org/p/439436/))
 
-### Conclusion
+#### Conclusion
 
 Comparing three-group comparison to two-group comparison dramatically lowers DEG counts (77 vs 786 for liver) in line with what the literature predicts for multi-group vs pairwise analyses. The recommended approach is to:
 
@@ -141,7 +142,7 @@ run_pairwise_deg_analysis <- function(dds_filtered_3group, tissue_name, alpha = 
 }
 ```
 
-```{r pairwise DEGs, cache=TRUE}
+```{r pairwise DEGs, cache = TRUE}
 # Run pairwise DEG analysis for all tissues
 all_pairwise_deg_results <- map(results_list, function(tissue_data) {
   run_pairwise_deg_analysis(tissue_data$dds_filtered, tissue_data$tissue)
@@ -182,5 +183,454 @@ kable(pairwise_comparison_summaries, caption = "Pairwise DEG Summary Across All 
 ```{r save pairwise results}
 # Save pairwise DEG results
 saveRDS(all_pairwise_deg_results, "pairwise_deg_results_by_tissue.rds")
+
+```
+
+### Expression Pattern Classification Analysis
+#### Rationale
+Standard differential expression analysis identifies genes with statistically significant fold changes between conditions but does not distinguish between different underlying expression patterns. A gene showing an X-fold increase could represent either: (1) activation of a previously silent gene (0 → 100 counts), or (2) upregulation of an already expressed gene (50 → 100 counts). These patterns reflect distinct biological mechanisms - gene activation versus transcriptional modulation - which may have different functional implications and therapeutic relevance.
+
+#### Methodology
+To classify differential expression patterns, we developed a complementary analysis that categorizes significantly differentially expressed genes based on their baseline expression levels in each condition. For each pairwise comparison, genes were classified into distinct expression pattern categories using normalized count data from DESeq2.
+
+#### Classification Algorithm
+For each significantly differentially expressed gene (FDR < 0.01, |log2FC| > 0.5), we calculated mean normalized expression levels for both conditions and applied the following classification criteria using a low expression threshold of 1 normalized count:
+
+*Newly Expressed*: Genes with low expression (≤1 count) in the reference condition and detectable expression (>1 count) in the comparison condition, with corresponding positive or negative log2FC supporting the direction of change.
+*Silenced*: Genes with detectable expression (>1 count) in the reference condition and low expression (≤1 count) in the comparison condition, with corresponding log2FC supporting gene silencing.
+*Increased/Decreased*: Genes with detectable expression (>1 count) in both conditions, where the log2FC indicates significant upregulation or downregulation between conditions.
+*No Clear Pattern*: Genes not fitting the above categories or showing ambiguous patterns.
+
+
+```{r function to classify expression pattern}
+
+# Function to classify expression patterns
+classify_expression_pattern <- function(dds_pairwise, res_df, groups_to_compare, low_expr_threshold = 1) {
+  
+  # Get normalized counts for the two groups
+  norm_counts <- counts(dds_pairwise, normalized = TRUE)
+  
+  # Calculate mean expression for each group
+  group1_samples <- colnames(dds_pairwise)[dds_pairwise$treatment == groups_to_compare[1]]
+  group2_samples <- colnames(dds_pairwise)[dds_pairwise$treatment == groups_to_compare[2]]
+  
+  group1_mean <- rowMeans(norm_counts[, group1_samples, drop = FALSE])
+  group2_mean <- rowMeans(norm_counts[, group2_samples, drop = FALSE])
+  
+  # Match gene order with res_df to ensure same length
+  # Only include genes that are in res_df (some might be filtered out)
+  genes_in_results <- res_df$gene_id
+  genes_in_counts <- rownames(norm_counts)
+  
+  # Find matching genes
+  matching_genes <- intersect(genes_in_results, genes_in_counts)
+  
+  # Subset means to matching genes only
+  group1_mean_matched <- group1_mean[matching_genes]
+  group2_mean_matched <- group2_mean[matching_genes]
+  
+  # Create a data frame to ensure proper matching
+  classification_df <- data.frame(
+    gene_id = matching_genes,
+    group1_mean = group1_mean_matched,
+    group2_mean = group2_mean_matched,
+    stringsAsFactors = FALSE
+  )
+  
+  # Merge with res_df to ensure same order and length
+  res_with_means <- merge(res_df, classification_df, by = "gene_id", all.x = TRUE, sort = FALSE)
+  
+  # Create classification based on DESeq2 contrast direction
+  expression_classification <- case_when(
+    # Newly expressed in group1: group2 low, group1 high, positive log2FC
+    res_with_means$group2_mean <= low_expr_threshold & res_with_means$group1_mean > low_expr_threshold & res_with_means$log2FoldChange > 0 ~ "only_group1",
+    
+    # Newly expressed in group2: group1 low, group2 high, negative log2FC
+    res_with_means$group1_mean <= low_expr_threshold & res_with_means$group2_mean > low_expr_threshold & res_with_means$log2FoldChange < 0 ~ "only_group2",
+    
+    # Silenced in group1: group1 low, group2 high, negative log2FC
+    res_with_means$group1_mean <= low_expr_threshold & res_with_means$group2_mean > low_expr_threshold & res_with_means$log2FoldChange < 0 ~ "silenced_group1",
+    
+    # Silenced in group2: group2 low, group1 high, positive log2FC  
+    res_with_means$group2_mean <= low_expr_threshold & res_with_means$group1_mean > low_expr_threshold & res_with_means$log2FoldChange > 0 ~ "silenced_group2",
+    
+    # Increased in group1: Both expressed, positive log2FC
+    res_with_means$group1_mean > low_expr_threshold & res_with_means$group2_mean > low_expr_threshold & res_with_means$log2FoldChange > 0 ~ "increased_group1",
+    
+    # Increased in group2: Both expressed, negative log2FC
+    res_with_means$group1_mean > low_expr_threshold & res_with_means$group2_mean > low_expr_threshold & res_with_means$log2FoldChange < 0 ~ "increased_group2",
+    
+    # Default for non-significant or edge cases
+    TRUE ~ "no_clear_pattern"
+  )
+  
+  return(expression_classification)
+}
+
+# Updated DEG analysis function with expression classification
+run_pairwise_deg_analysis_with_classification <- function(dds_filtered_3group, tissue_name, alpha = 0.01, lfc_threshold = 0.5) {
+  
+  # Define the three pairwise comparisons
+  comparisons <- list(
+    reprogramming_control = c("Dox-4F", "Control"),
+    reprogramming_young = c("Dox-4F", "None"), 
+    old_young = c("Control", "None")
+  )
+  
+  # Run each pairwise comparison separately
+  deg_results <- map(comparisons, function(groups_to_compare) {
+    # Subset to only the two groups for this comparison
+    samples_subset <- colnames(dds_filtered_3group)[dds_filtered_3group$treatment %in% groups_to_compare]
+    dds_pairwise <- dds_filtered_3group[, samples_subset]
+    
+    # Drop unused factor levels
+    dds_pairwise$treatment <- droplevels(dds_pairwise$treatment)
+    
+    # Run DESeq on the 2-group subset
+    dds_pairwise <- DESeq(dds_pairwise, quiet = TRUE)
+    
+    # Create contrast for this comparison (first group vs second group)
+    contrast_vector <- c("treatment", groups_to_compare[1], groups_to_compare[2])
+    
+    # Extract results
+    res <- results(dds_pairwise, 
+                   contrast = contrast_vector,
+                   alpha = alpha,
+                   cooksCutoff = FALSE,
+                   independentFiltering = FALSE,
+                   pAdjustMethod = 'fdr')
+    
+    # Convert to data frame
+    res_df <- as.data.frame(res) %>%
+      rownames_to_column("gene_id") %>%
+      filter(!is.na(padj)) %>%
+      arrange(padj, pvalue)
+    
+    # Add expression classification
+    res_df$expression_category <- classify_expression_pattern(dds_pairwise, res_df, groups_to_compare)
+    
+    # Add significance categories  
+    res_df <- res_df %>%
+      mutate(
+        significance = case_when(
+          padj < alpha & abs(log2FoldChange) >= lfc_threshold ~ "Significant",
+          TRUE ~ "Not significant"
+        ),
+        direction = case_when(
+          significance == "Significant" & log2FoldChange > 0 ~ "Up",
+          significance == "Significant" & log2FoldChange < 0 ~ "Down",
+          TRUE ~ "None"
+        )
+      )
+    
+    return(res_df)
+  })
+  
+  # Add tissue and comparison names
+  deg_results <- imap(deg_results, function(res, comp_name) {
+    res$tissue <- tissue_name
+    res$comparison <- comp_name
+    return(res)
+  })
+  
+  return(deg_results)
+}
+
+```
+
+
+```{r expression-classificationanalysis, cache=TRUE}
+
+# run 
+all_pairwise_deg_results_with_categories <- map(results_list, function(tissue_data) {
+  run_pairwise_deg_analysis_with_classification(tissue_data$dds_filtered, tissue_data$tissue)
+})
+
+# Flatten the results
+all_pairwise_deg_results_flat_with_categories <- map_dfr(1:length(all_pairwise_deg_results_with_categories), function(i) {
+  tissue_results <- all_pairwise_deg_results_with_categories[[i]]
+  map_dfr(tissue_results, identity)
+})
+
+# summarize by expression category
+category_summary <- all_pairwise_deg_results_flat_with_categories %>%
+  filter(significance == "Significant") %>%
+  dplyr::count(tissue, comparison, expression_category) %>%
+  pivot_wider(names_from = expression_category, values_from = n, values_fill = 0)
+
+kable(category_summary, 
+      caption = "Expression Pattern Classification Summary by Tissue and Comparison",
+      digits = 0)
+
+saveRDS(all_pairwise_deg_results_with_categories, "deg_results_with_classification_nested.rds")
+saveRDS(all_pairwise_deg_results_flat_with_categories, "deg_results_with_classification_flat.rds")
+
+```
+
+
+
+## 1. Multi-Panel Heatmap Comparison
+
+```{r visualization-setup}
+# Prepare data for visualization
+library(ggplot2)
+library(patchwork)
+library(viridis)
+library(pheatmap)
+
+all_pairwise_deg_results_with_categories <- readRDS("/Users/u013911/Desktop/project2/scripts/deg_results_with_classification_nested.rds")
+all_pairwise_deg_results_flat_with_categories <- readRDS("/Users/u013911/Desktop/project2/scripts/deg_results_with_classification_flat.rds")
+
+# Filter for only kidney, liver, and spleen
+tissues_to_keep <- c("Kidney", "Liver", "Spleen")
+
+all_pairwise_deg_results_flat_with_categories <- all_pairwise_deg_results_flat_with_categories %>%
+  filter(tissue %in% tissues_to_keep)
+
+# Recreate summary tables with filtered data
+pairwise_deg_summary <- all_pairwise_deg_results_flat_with_categories %>%
+  filter(significance == "Significant") %>%
+  dplyr::count(tissue, comparison, direction) %>%
+  pivot_wider(names_from = direction, values_from = n, values_fill = 0) %>%
+  mutate(Total = Up + Down)
+
+category_summary <- all_pairwise_deg_results_flat_with_categories %>%
+  filter(significance == "Significant") %>%
+  dplyr::count(tissue, comparison, expression_category) %>%
+  pivot_wider(names_from = expression_category, values_from = n, values_fill = 0)
+
+
+kable(pairwise_deg_summary,
+      caption = "Differential Expression by Tissue and Comparison",
+      digits = 0)
+
+# Define theme
+pub_theme <- theme_bw() +
+  theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 10),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9),
+    strip.text = element_text(size = 10, face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(linewidth = 0.2)
+  )
+```
+
+## Figure 1: Number of Differentially Expressed Genes by Tissue and Comparison
+
+```{r fig1-deg-counts, fig.height=6, fig.width=10}
+
+# Split bar chart showing up/down regulation
+deg_data_split <- pairwise_deg_summary %>%
+  select(tissue, comparison, Up, Down) %>%
+  mutate(
+    comparison = factor(comparison, 
+                       levels = c("old_young", "reprogramming_control", "reprogramming_young"),
+                       labels = c("Old vs Young", "Dox-4F vs Control", "Dox-4F vs Young")),
+    # Make downregulated negative for plotting
+    Down = -Down
+  ) %>%
+  pivot_longer(cols = c(Up, Down), names_to = "Direction", values_to = "Count")
+
+ggplot(deg_data_split, aes(x = tissue, y = Count, fill = interaction(comparison, Direction))) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.8, color = "white", size = 0.5) +
+  geom_hline(yintercept = 0, color = "black", size = 0.3) +
+  scale_fill_manual(values = c(
+    # Old vs Young
+    "Old vs Young.Up" = "#2E4A62",
+    "Old vs Young.Down" = "#1B2D3E", 
+    # Dox-4F vs Control  
+    "Dox-4F vs Control.Up" = "#5D737E",
+    "Dox-4F vs Control.Down" = "#3A4A52",
+    # Dox-4F vs Young
+    "Dox-4F vs Young.Up" = "#8DA0A0", 
+    "Dox-4F vs Young.Down" = "#5A6B6B"
+  ), guide = "none") +
+  coord_flip() +
+  labs(
+    title = "Up- and Down-regulated Genes by Tissue and Comparison",
+    y = "Number of DEGs",
+    x = "Tissue", 
+    subtitle = "Upregulated (right) and Downregulated (left)"
+  ) +
+  pub_theme +
+  theme(legend.position = "bottom") +
+  # Add custom legend
+  annotate("text", y = max(deg_data_split$Count) * 0.8, x = 0.7, 
+           label = "Upregulated", hjust = 0, size = 3) +
+  annotate("text", y = min(deg_data_split$Count) * 0.8, x = 0.7, 
+           label = "Downregulated", hjust = 1, size = 3)
+```
+
+
+## Figure 3: Expression Pattern Classification
+
+```{r fig3-patterns, fig.height=6, fig.width=12}
+# Show switching vs modulation patterns
+pattern_data <- category_summary %>%
+  mutate(
+    Exclusive = only_group1 + only_group2,
+    Modulated = increased_group1 + increased_group2,
+    comparison = factor(comparison, 
+                       levels = c("old_young", "reprogramming_control", "reprogramming_young"),
+                       labels = c("Old vs Young", "Dox-4F vs Control", "Dox-4F vs Young"))
+  ) %>%
+  select(tissue, comparison, Exclusive, Modulated) %>%
+  pivot_longer(cols = c(Exclusive, Modulated), names_to = "Pattern", values_to = "Count")
+
+ggplot(pattern_data, aes(x = tissue, y = Count, fill = Pattern)) +
+  geom_bar(stat = "identity", position = "stack", alpha = 0.8) +
+  facet_wrap(~ comparison, scales = "free_y") +
+  scale_fill_manual(values = c("Exclusive" = "#fee08b", "Modulated" = "#74add1")) +
+  labs(
+    title = "Expression Pattern Classification",
+    x = "Tissue",
+    y = "Number of DEGs",
+    fill = "Expression Pattern"
+  ) +
+  pub_theme +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Figure 4: Comparative Analysis Across Tissues
+
+```{r fig4-heatmap, fig.height=6, fig.width=8}
+# Clean heatmap for tissue comparison
+heatmap_data <- pairwise_deg_summary %>%
+  select(tissue, comparison, Total) %>%
+  mutate(
+    comparison = factor(comparison, 
+                       levels = c("old_young", "reprogramming_control", "reprogramming_young"),
+                       labels = c("Old vs Young", "Dox-4F vs Control", "Dox-4F vs Young"))
+  ) %>%
+  pivot_wider(names_from = comparison, values_from = Total, values_fill = 0)
+
+# Convert to matrix for heatmap
+heatmap_matrix <- as.matrix(heatmap_data[, -1])
+rownames(heatmap_matrix) <- heatmap_data$tissue
+
+# Create heatmap using ggplot2
+heatmap_long <- heatmap_data %>%
+  pivot_longer(cols = -tissue, names_to = "comparison", values_to = "degs") %>%
+  mutate(tissue = factor(tissue, levels = rownames(heatmap_matrix)[order(rowSums(heatmap_matrix))]))
+
+ggplot(heatmap_long, aes(x = comparison, y = tissue, fill = degs)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = degs), color = "white", fontface = "bold") +
+  scale_fill_viridis_c(name = "DEGs") +
+  labs(
+    title = "Differentially Expressed Genes Across Tissues and Comparisons",
+    x = "Comparison",
+    y = "Tissue"
+  ) +
+  pub_theme +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+```
+
+
+## Figure 6: Summary Statistics Table
+
+```{r fig6-summary-table}
+# Create publication-ready summary table
+summary_stats <- pairwise_deg_summary %>%
+  mutate(
+    comparison = factor(comparison, 
+                       levels = c("old_young", "reprogramming_control", "reprogramming_young"),
+                       labels = c("Old vs Young", "Dox-4F vs Control", "Dox-4F vs Young")),
+    `Up:Down Ratio` = round(Up / Down, 2)
+  ) %>%
+  select(Tissue = tissue, Comparison = comparison, 
+         Upregulated = Up, Downregulated = Down, 
+         Total = Total, `Up:Down Ratio`)
+
+knitr::kable(summary_stats, 
+             caption = "Summary of Differentially Expressed Genes by Tissue and Comparison",
+             format = "markdown")
+```
+
+
+
+
+```{r map to biomart gene ids}
+
+library(gprofiler2)
+
+# Remove version numbers from Ensembl IDs
+all_pairwise_deg_results_flat_with_categories <- all_pairwise_deg_results_flat_with_categories %>%
+  mutate(ensembl_clean = str_remove(gene_id, "\\..*"))
+
+# Get unique Ensembl IDs for mapping
+unique_ensembl <- unique(all_pairwise_deg_results_flat_with_categories$ensembl_clean)
+
+# Use g:profiler to convert Ensembl IDs to gene names
+gene_mapping <- gconvert(query = unique_ensembl, 
+                        organism = "mmusculus", 
+                        target = "ENSG", 
+                        mthreshold = Inf, 
+                        filter_na = FALSE)
+
+
+# Capitalize gene symbols and remove gene_name column
+all_pairwise_deg_results_flat_with_categories <- all_pairwise_deg_results_flat_with_categories %>%
+ mutate(gene_symbol = toupper(gene_symbol))
+
+```
+ 
+### Which genes are activated or silenced relative to the comparison group? 
+
+```{r gene activation and silencing}
+
+# First, let's see what we're working with
+exclusive_genes <- all_pairwise_deg_results_flat_with_categories %>%
+  filter(expression_category %in% c("only_group1", "only_group2"))
+
+# Summary counts
+exclusive_summary <- exclusive_genes %>%
+  dplyr::count(tissue, comparison, expression_category) %>%
+  pivot_wider(names_from = expression_category, values_from = n, values_fill = 0)
+
+kable(exclusive_summary, caption = "Exclusively expressed genes by tissue and comparison")
+```
+
+
+```{r save excel file}
+library(openxlsx)
+
+# Create a workbook
+wb <- createWorkbook()
+
+# Get all unique tissue-comparison combinations
+tissue_comparison_combos <- all_pairwise_deg_results_flat_with_categories %>%
+ distinct(tissue, comparison) %>%
+ mutate(sheet_name = paste(tissue, comparison, sep = "_"))
+
+# Create sheets and add data for each tissue-comparison combination
+for(i in 1:nrow(tissue_comparison_combos)) {
+ tissue_name <- tissue_comparison_combos$tissue[i]
+ comparison_name <- tissue_comparison_combos$comparison[i]
+ sheet_name <- tissue_comparison_combos$sheet_name[i]
+ 
+ # Filter data for this combination - only significant genes
+ sheet_data <- all_pairwise_deg_results_flat_with_categories %>%
+   filter(tissue == tissue_name, 
+          comparison == comparison_name,
+          significance == "Significant") %>%
+   select(gene_id, gene_symbol, baseMean, log2FoldChange, lfcSE, stat, padj, expression_category, direction) %>%
+   arrange(padj)
+ 
+ # Add worksheet
+ addWorksheet(wb, sheet_name)
+ writeDataTable(wb, sheet_name, sheet_data, 
+                tableStyle = "TableStyleMedium2",
+                tableName = paste0("Table_", gsub("[^A-Za-z0-9]", "_", sheet_name)))
+}
+
+# Save the workbook
+saveWorkbook(wb, "differential_expression_results_significant_only.xlsx", overwrite = TRUE)
 
 ```
